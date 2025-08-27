@@ -1,262 +1,304 @@
-import os, time, uuid, math, json
+"""
+Production-ready FastAPI service for entrepreneur readiness scoring and summarization.
+"""
+import os
+import time
+import uuid
 from typing import Optional, Dict, Any
-from fastapi import FastAPI, HTTPException, Request, Response
+import logging
+
+import numpy as np
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, validator
-import uvicorn
 import requests
+import skops.io as sio
+import uvicorn
 
-# ---- Load XGBoost via skops (recommended format for HF/xgb) ----
-from skops.io import load as skops_load
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-APP_NAME = "entrepreneur-readiness-api"
-VERSION = "1.0.0"
+# Environment variables
+HF_API_KEY = os.getenv("HF_API_KEY")
+MODEL_PATH = os.getenv("MODEL_PATH", "model/model.skops")
+MODEL_ID = os.getenv("MODEL_ID", "ethnmcl/entrepreneur-readiness-xgb")
+HF_SUMMARY_MODEL = os.getenv("HF_SUMMARY_MODEL", "ethnmcl/gpt2-entrepreneur-agent")
+ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "https://*.hf.space,https://huggingface.co").split(",")
 
-# env
-ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "*")
-MODEL_PATH      = os.getenv("MODEL_PATH", "model/model.skops")  # your exported xgb model here
-MODEL_ID        = os.getenv("MODEL_ID", "ethnmcl/entrepreneur-readiness-xgb")
-HF_API_KEY      = os.getenv("HF_API_KEY", "").strip()
-HF_SUMMARY_MODEL= os.getenv("HF_SUMMARY_MODEL", "ethnmcl/gpt2-entrepreneur-agent")
+# Validate required environment variables
+if not HF_API_KEY:
+    logger.error("HF_API_KEY environment variable is required")
+    raise RuntimeError("HF_API_KEY environment variable is required")
 
-# ---- App ----
-app = FastAPI(title=APP_NAME, version=VERSION)
+# Initialize FastAPI app
+app = FastAPI(
+    title="Entrepreneur Readiness API",
+    description="Production API for entrepreneur readiness scoring and summarization",
+    version="1.0.0"
+)
 
-# CORS
-origins = [o.strip() for o in ALLOWED_ORIGINS.split(",")] if ALLOWED_ORIGINS else ["*"]
+# Add CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins if origins != [""] else ["*"],
-    allow_credentials=False,
-    allow_methods=["*"],
+    allow_origins=ALLOWED_ORIGINS,
+    allow_credentials=True,
+    allow_methods=["GET", "POST"],
     allow_headers=["*"],
 )
 
-# ---- Simple in-memory rate limiter (per IP) ----
-from collections import defaultdict, deque
-import time as _t
-WINDOW_SEC = float(os.getenv("RL_WINDOW_SEC", "3.0"))
-MAX_REQS   = int(os.getenv("RL_MAX_REQS", "15"))
-_hits: Dict[str, deque] = defaultdict(deque)
+# Global model variable
+model = None
 
-def rate_limit(ip: str) -> bool:
-    now = _t.time()
-    dq = _hits[ip]
-    while dq and now - dq[0] > WINDOW_SEC:
-        dq.popleft()
-    if len(dq) >= MAX_REQS:
-        return False
-    dq.append(now)
-    return True
-
-# ---- Logging / request id middleware ----
-@app.middleware("http")
-async def add_request_id(request: Request, call_next):
-    rid = request.headers.get("x-request-id") or str(uuid.uuid4())
-    start = time.time()
-    response: Response
-    try:
-        response = await call_next(request)
-    except Exception as e:
-        response = Response(status_code=500, content=json.dumps({
-            "error": {"type":"internal_error","message":str(e),"request_id":rid}
-        }), media_type="application/json")
-    dur = int((time.time() - start) * 1000)
-    response.headers["x-request-id"] = rid
-    response.headers["x-response-time-ms"] = str(dur)
-    return response
-
-# ---- Model loading ----
-_model = None
 def load_model():
-    global _model
-    if _model is None:
-        _model = skops_load(MODEL_PATH)  # must be created from your trained xgb model
-    return _model
+    """Load the XGBoost model from skops artifact."""
+    global model
+    if model is None:
+        try:
+            logger.info(f"Loading model from {MODEL_PATH}")
+            model = sio.load(MODEL_PATH, trusted=True)
+            logger.info("Model loaded successfully")
+        except Exception as e:
+            logger.error(f"Failed to load model: {e}")
+            raise RuntimeError(f"Failed to load model: {e}")
+    return model
 
-# ---- Schemas ----
-class InputPayload(BaseModel):
-    savings: float
-    monthly_income: float
-    monthly_expenses: float
-    monthly_entertainment: float
-    sales_skills: float
-    dependents: float
-    age: float
-    assets: float
-    risk_level: float
-    confidence: float
-    idea_difficulty: float
-
-    # optional/derived
-    entrepreneurial_readiness_score: Optional[float] = Field(default=None)  # label; never used in predict
+class ScoreInput(BaseModel):
+    """Input schema for scoring endpoint."""
+    # Required numeric fields
+    savings: float = Field(..., description="Savings amount")
+    monthly_income: float = Field(..., description="Monthly income")
+    monthly_expenses: float = Field(..., description="Monthly expenses")
+    monthly_entertainment: float = Field(..., description="Monthly entertainment expenses")
+    sales_skills: float = Field(..., description="Sales skills rating")
+    dependents: float = Field(..., description="Number of dependents")
+    age: float = Field(..., description="Age")
+    assets: float = Field(..., description="Assets value")
+    risk_level: float = Field(..., description="Risk tolerance level")
+    confidence: float = Field(..., description="Confidence level")
+    idea_difficulty: float = Field(..., description="Idea difficulty rating")
+    
+    # Optional fields
+    entrepreneurial_readiness_score: Optional[float] = None
     savings_ratio: Optional[float] = None
     expense_ratio: Optional[float] = None
     entertainment_ratio: Optional[float] = None
-
-    # optional strings (ignored by model; carried through for context)
     entrepreneur_type: Optional[str] = None
     education_level: Optional[str] = None
     funding_source: Optional[str] = None
 
-    @validator("*", pre=True)
-    def coerce(cls, v):
-        # make "3" -> 3 where sensible
-        if isinstance(v, str):
-            v = v.strip()
-            if v == "":
-                return v
-            try:
-                if any(k in cls.__fields__ for k in []):  # placeholder
-                    pass
-            except: 
-                pass
-        return v
+    @validator('savings_ratio', pre=True, always=True)
+    def compute_savings_ratio(cls, v, values):
+        if v is not None:
+            return v
+        monthly_income = values.get('monthly_income', 0)
+        savings = values.get('savings', 0)
+        return savings / monthly_income if monthly_income != 0 else 0
 
-    def with_ratios(self) -> "InputPayload":
-        d = self.dict()
-        mi = float(d.get("monthly_income") or 0.0)
-        if not d.get("savings_ratio"):
-            d["savings_ratio"] = (float(d.get("savings") or 0.0) / (mi if mi != 0 else 1.0))
-        if not d.get("expense_ratio"):
-            d["expense_ratio"] = (float(d.get("monthly_expenses") or 0.0) / (mi if mi != 0 else 1.0))
-        if not d.get("entertainment_ratio"):
-            d["entertainment_ratio"] = (float(d.get("monthly_entertainment") or 0.0) / (mi if mi != 0 else 1.0))
-        return InputPayload(**d)
+    @validator('expense_ratio', pre=True, always=True)
+    def compute_expense_ratio(cls, v, values):
+        if v is not None:
+            return v
+        monthly_income = values.get('monthly_income', 0)
+        monthly_expenses = values.get('monthly_expenses', 0)
+        return monthly_expenses / monthly_income if monthly_income != 0 else 0
+
+    @validator('entertainment_ratio', pre=True, always=True)
+    def compute_entertainment_ratio(cls, v, values):
+        if v is not None:
+            return v
+        monthly_income = values.get('monthly_income', 0)
+        monthly_entertainment = values.get('monthly_entertainment', 0)
+        return monthly_entertainment / monthly_income if monthly_income != 0 else 0
+
+class SummarizeInput(BaseModel):
+    """Input schema for summarization endpoint."""
+    input: ScoreInput = Field(..., description="Original input data")
+    score: float = Field(..., description="Computed score")
+    band: str = Field(..., description="Score band (Low/Med/High)")
 
 class ScoreResponse(BaseModel):
+    """Response schema for scoring endpoint."""
     score: float
     band: str
     meta: Dict[str, Any]
 
-class SummarizeRequest(BaseModel):
-    input: InputPayload
-    score: float
-    band: str
-
 class SummarizeResponse(BaseModel):
+    """Response schema for summarization endpoint."""
     summary: str
     meta: Dict[str, Any]
 
-# ---- Utils ----
-def clamp(v: float, lo: float, hi: float) -> float:
-    return max(lo, min(hi, v))
+def get_score_band(score: float) -> str:
+    """Determine score band based on score value."""
+    if score < 50:
+        return "Low"
+    elif score < 75:
+        return "Med"
+    else:
+        return "High"
 
-def band(score: float) -> str:
-    return "Low" if score < 50 else ("Med" if score < 75 else "High")
+def prepare_model_input(data: ScoreInput) -> np.ndarray:
+    """Prepare input data for model prediction."""
+    # Convert input to feature array - adjust this based on your model's expected features
+    features = [
+        data.savings,
+        data.monthly_income,
+        data.monthly_expenses,
+        data.monthly_entertainment,
+        data.sales_skills,
+        data.dependents,
+        data.age,
+        data.assets,
+        data.risk_level,
+        data.confidence,
+        data.idea_difficulty,
+        data.savings_ratio or 0,
+        data.expense_ratio or 0,
+        data.entertainment_ratio or 0
+    ]
+    return np.array(features).reshape(1, -1)
 
-def normalize_score(y: float) -> float:
-    try:
-        v = float(y)
-    except:
-        v = 0.0
-    return clamp(v * 100.0 if 0.0 <= v <= 1.0 else v, 0.0, 100.0)
-
-def summary_prompt(inp: dict, score: float, band_str: str) -> str:
-    return (
-        "You are a concise analyst for an Entrepreneur Readiness Agent.\n\n"
-        "GOAL\n"
-        "Write a clear 2–4 sentence summary of the founder/startup based on structured inputs and a readiness score.\n"
-        'End with ONE specific, actionable next step on a new line prefixed with "Next:".\n\n'
-        "RULES\n"
-        "- Do NOT invent metrics or claims not present in the input JSON.\n"
-        "- Reflect the provided score and band exactly as given.\n"
-        "- If data is missing/empty, acknowledge it briefly instead of guessing.\n\n"
-        f"INPUT\nJSON: {json.dumps(inp, ensure_ascii=False)}\n"
-        f"Score (0–100): {score}\nBand: {band_str}\n\nBEGIN SUMMARY\n"
-    )
-
-def hf_textgen(prompt: str) -> str:
-    if not HF_API_KEY:
-        raise HTTPException(status_code=500, detail="HF_API_KEY not configured on server")
+def call_huggingface_api(prompt: str, max_retries: int = 3) -> str:
+    """Call Hugging Face Inference API with retry logic."""
     url = f"https://api-inference.huggingface.co/models/{HF_SUMMARY_MODEL}"
-    headers = {"Authorization": f"Bearer {HF_API_KEY}", "Content-Type":"application/json"}
-    payload = {
-        "inputs": prompt,
-        "parameters": {
-            "max_new_tokens": 180,
-            "temperature": 0.4,
-            "top_p": 0.9,
-            "repetition_penalty": 1.1
-        }
-    }
-    # simple retries on 429/503
-    for attempt in range(3):
-        r = requests.post(url, headers=headers, json=payload, timeout=60)
-        if r.status_code in (429, 503):
-            time.sleep((0.7 * (2 ** attempt)))
-            continue
-        if r.status_code != 200:
-            raise HTTPException(status_code=502, detail=f"HF upstream error {r.status_code}: {r.text[:400]}")
+    headers = {"Authorization": f"Bearer {HF_API_KEY}"}
+    
+    for attempt in range(max_retries):
         try:
-            js = r.json()
-            if isinstance(js, list) and js and isinstance(js[0], dict) and "generated_text" in js[0]:
-                return js[0]["generated_text"].strip()
-            return str(js).strip()
-        except Exception as e:
-            raise HTTPException(status_code=502, detail=f"HF parse error: {str(e)}")
+            response = requests.post(
+                url,
+                headers=headers,
+                json={"inputs": prompt, "parameters": {"max_length": 200, "temperature": 0.7}},
+                timeout=30
+            )
+            
+            if response.status_code == 200:
+                result = response.json()
+                if isinstance(result, list) and len(result) > 0:
+                    return result[0].get("generated_text", "").strip()
+                return str(result).strip()
+            
+            elif response.status_code in [429, 503]:
+                wait_time = 2 ** attempt
+                logger.warning(f"API rate limited, retrying in {wait_time}s (attempt {attempt + 1}/{max_retries})")
+                time.sleep(wait_time)
+                continue
+            
+            else:
+                logger.error(f"HF API error: {response.status_code} - {response.text}")
+                raise HTTPException(status_code=500, detail="Summary generation failed")
+                
+        except requests.RequestException as e:
+            logger.error(f"Request error: {e}")
+            if attempt == max_retries - 1:
+                raise HTTPException(status_code=500, detail="Summary generation failed")
+            time.sleep(2 ** attempt)
+    
+    raise HTTPException(status_code=500, detail="Summary generation failed after retries")
 
-# ---- Routes ----
+def generate_summary_prompt(data: ScoreInput, score: float, band: str) -> str:
+    """Generate prompt for summarization model."""
+    return f"""
+Entrepreneur Profile Analysis:
+- Score: {score}/100 ({band} readiness)
+- Age: {data.age}, Dependents: {data.dependents}
+- Monthly Income: ${data.monthly_income:,.0f}
+- Savings: ${data.savings:,.0f} (ratio: {data.savings_ratio:.2f})
+- Risk Level: {data.risk_level}/10
+- Confidence: {data.confidence}/10
+- Sales Skills: {data.sales_skills}/10
+
+Provide a 2-4 sentence assessment of this entrepreneur's readiness, ending with one specific actionable step prefixed with 'Next:'.
+""".strip()
+
+@app.on_event("startup")
+async def startup_event():
+    """Load model on startup."""
+    load_model()
+
 @app.get("/healthz")
-def healthz():
-    return {"status":"ok","uptime_s": int(time.process_time())}
+async def health_check():
+    """Health check endpoint."""
+    return {"status": "ok"}
 
 @app.post("/v1/score", response_model=ScoreResponse)
-def score(req: Request, body: InputPayload):
-    ip = req.client.host if req.client else "unknown"
-    if not rate_limit(ip):
-        raise HTTPException(status_code=429, detail="Rate limited")
-    rid = str(uuid.uuid4())
-    t0 = time.time()
-
-    # compute ratios & drop label for features
-    body2 = body.with_ratios()
-    features = body2.dict()
-    features.pop("entrepreneurial_readiness_score", None)  # never send labels
-
-    # order features if your model expects specific order (example keeps dict order)
-    model = load_model()
+async def score_endpoint(data: ScoreInput):
+    """Score entrepreneur readiness based on input data."""
+    start_time = time.time()
+    request_id = str(uuid.uuid4())
+    
     try:
-        # If your skops model is a sklearn/xgb pipeline with predict_proba:
-        if hasattr(model, "predict_proba"):
-            p = model.predict_proba([list(features.values())])[0]
-            # choose positive class prob if binary
-            y = float(p[1]) if len(p) > 1 else float(p[0])
+        # Load model if not already loaded
+        model_instance = load_model()
+        
+        # Prepare input for model
+        model_input = prepare_model_input(data)
+        
+        # Make prediction
+        prediction = model_instance.predict(model_input)[0]
+        
+        # Normalize score to 0-100 range
+        if 0 <= prediction <= 1:
+            score = prediction * 100
         else:
-            # fallback: plain predict
-            y = float(model.predict([list(features.values())])[0])
+            score = prediction
+        
+        # Ensure score is within bounds
+        score = max(0, min(100, float(score)))
+        
+        # Determine band
+        band = get_score_band(score)
+        
+        duration_ms = int((time.time() - start_time) * 1000)
+        
+        return ScoreResponse(
+            score=round(score, 1),
+            band=band,
+            meta={
+                "duration_ms": duration_ms,
+                "model_id": MODEL_ID,
+                "request_id": request_id
+            }
+        )
+        
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Model inference error: {e}")
-
-    score_val = normalize_score(y)
-    band_val  = band(score_val)
-
-    dur = int((time.time() - t0) * 1000)
-    return ScoreResponse(
-        score=score_val,
-        band=band_val,
-        meta={"duration_ms": dur, "model_id": MODEL_ID, "request_id": rid}
-    )
+        logger.error(f"Scoring error: {e}")
+        raise HTTPException(status_code=500, detail=f"Scoring failed: {str(e)}")
 
 @app.post("/v1/summarize", response_model=SummarizeResponse)
-def summarize(req: Request, body: SummarizeRequest):
-    ip = req.client.host if req.client else "unknown"
-    if not rate_limit(ip):
-        raise HTTPException(status_code=429, detail="Rate limited")
-    rid = str(uuid.uuid4())
-    t0 = time.time()
-
-    # build the prompt using the *input exactly as provided*
-    inp = body.input.with_ratios().dict()
-    # never leak labels to external callers (not used here anyway, but keep clean)
-    prompt = summary_prompt(inp, body.score, body.band)
-
-    text = hf_textgen(prompt)
-    dur = int((time.time() - t0) * 1000)
-    return SummarizeResponse(
-        summary=text,
-        meta={"duration_ms": dur, "model_id": HF_SUMMARY_MODEL, "request_id": rid}
-    )
+async def summarize_endpoint(data: SummarizeInput):
+    """Generate summary based on scoring results."""
+    start_time = time.time()
+    request_id = str(uuid.uuid4())
+    
+    try:
+        # Generate prompt
+        prompt = generate_summary_prompt(data.input, data.score, data.band)
+        
+        # Call Hugging Face API
+        summary = call_huggingface_api(prompt)
+        
+        # Ensure summary ends with actionable step
+        if "Next:" not in summary:
+            summary += f" Next: Focus on improving your {data.band.lower()} readiness score through targeted skill development."
+        
+        duration_ms = int((time.time() - start_time) * 1000)
+        
+        return SummarizeResponse(
+            summary=summary,
+            meta={
+                "duration_ms": duration_ms,
+                "model_id": HF_SUMMARY_MODEL,
+                "request_id": request_id
+            }
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Summarization error: {e}")
+        raise HTTPException(status_code=500, detail=f"Summarization failed: {str(e)}")
 
 if __name__ == "__main__":
-    uvicorn.run("main:app", host="0.0.0.0", port=int(os.getenv("PORT", "8000")), workers=1)
+    port = int(os.getenv("PORT", 8000))
+    uvicorn.run("main:app", host="0.0.0.0", port=port, workers=1)
