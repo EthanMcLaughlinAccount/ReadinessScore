@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: entrepreneur-readiness-api
+    env: docker
+    branch: main
+    healthCheckPath: /healthz
+    envVars:
+      - key: HF_API_KEY
+        sync: false  # Will be set manually in Render dashboard
+      - key: MODEL_PATH
+        value: model/model.skops
+      - key: MODEL_ID
+        value: ethnmcl/entrepreneur-readiness-xgb
+      - key: HF_SUMMARY_MODEL
+        value: ethnmcl/gpt2-entrepreneur-agent
+      - key: ALLOWED_ORIGINS
+        value: https://*.hf.space,https://huggingface.co
