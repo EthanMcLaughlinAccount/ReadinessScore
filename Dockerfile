@@ -1,42 +1,32 @@
-# syntax=docker/dockerfile:1
 FROM python:3.11-slim
 
-ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1 \
-    PIP_NO_CACHE_DIR=1 \
-    DEBIAN_FRONTEND=noninteractive
-
-# OS deps
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential curl ca-certificates && \
-    rm -rf /var/lib/apt/lists/*
-
+# Set working directory
 WORKDIR /app
 
-# Install Python deps first for better layer caching
-COPY requirements.txt /app/requirements.txt
-RUN pip install -r requirements.txt
+# Install system dependencies
+RUN apt-get update && apt-get install -y \
+    gcc \
+    g++ \
+    && rm -rf /var/lib/apt/lists/*
 
-# Bring in the rest of the code (tolerates missing api/ or model/ dirs)
-COPY . /app
+# Copy requirements first for better caching
+COPY requirements.txt .
 
-# Ensure model dir exists even if no artifact is committed yet
+# Install Python dependencies
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy application code
+COPY . .
+
+# Ensure model directory exists
 RUN mkdir -p /app/model
 
-# Optional: healthcheck endpoint (FastAPI route /healthz)
+# Expose port (will be set by Render via $PORT)
 EXPOSE 8000
-HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
-  CMD curl -fsS http://localhost:${PORT:-8000}/healthz || exit 1
 
-# APP_MODULE can be overridden; we auto-detect api.main:app vs main:app
-ENV APP_MODULE="api.main:app"
+# Health check
+HEALTHCHECK --interval=30s --timeout=30s --start-period=5s --retries=3 \
+    CMD python -c "import requests; requests.get('http://localhost:$PORT/healthz')"
 
-# Start command:
-# - if /app/api/main.py exists, use api.main:app
-# - else if /app/main.py exists, use main:app
-# - bind to PORT if provided by platform, else 8000
-CMD bash -lc '\
-  MOD="${APP_MODULE}"; \
-  if [ ! -f "/app/api/main.py" ] && [ -f "/app/main.py" ]; then MOD="main:app"; fi; \
-  uvicorn "$MOD" --host 0.0.0.0 --port "${PORT:-8000}" --workers 2 \
-'
+# Run the application
+CMD uvicorn main:app --host 0.0.0.0 --port $PORT --workers 1
